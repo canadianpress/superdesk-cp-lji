@@ -2,7 +2,7 @@
     "name": "superdesk",
     "license": "GPL-3.0",
     "dependencies": {
-        "superdesk-analytics": "github:superdesk/superdesk-analytics#v2.1.2",
+        "superdesk-analytics": "github:superdesk/superdesk-analytics#v2.8.0",
         "superdesk-core": "github:superdesk/superdesk-client-core#v2.7.0"
     },
     "devDependencies": {
