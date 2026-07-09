@@ -1,8 +1,13 @@
 gunicorn
 honcho
+celery-redbeat
 python3-saml>=1.9,<1.17
 python-xmp-toolkit>=2.0.1,<2.1
-num2words==0.5.13
+num2words==0.5.14
+google-auth==2.40.3
+google-cloud-translate==3.21.1
+deepl==1.22.0
+dotenv==0.9.9
 
 Superdesk-Core[exiv2] @ git+https://github.com/superdesk/superdesk-core.git@release/2.10#egg=superdesk-core
 git+https://github.com/superdesk/superdesk-planning.git@release/2.10#egg=superdesk-planning
