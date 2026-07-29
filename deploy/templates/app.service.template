@@ -1,0 +1,28 @@
+[Unit]
+Description={{APP_NAME}} Application (Honcho)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory={{SERVER_DIR}}
+EnvironmentFile={{ENV_FILE}}
+Environment=PATH={{VENV_BIN}}:/usr/local/bin:/usr/bin:/bin
+
+# Honcho reads the repo's Procfile and starts all processes
+ExecStart={{VENV_BIN}}/honcho start --no-colour
+
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=append:{{LOG_DIR}}/app.log
+StandardError=append:{{LOG_DIR}}/app.error.log
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths={{LOG_DIR}} {{SERVER_DIR}} {{DEPLOY_DIR}}
+
+[Install]
+WantedBy=default.target
