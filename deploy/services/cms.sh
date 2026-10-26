@@ -11,13 +11,27 @@ TEMPLATE_DIR="${SCRIPT_DIR}/../templates"
 [[ -f "${SCRIPT_DIR}/../deploy.env" ]] && source "${SCRIPT_DIR}/../deploy.env"
 
 # Application configuration
-APP_NAME="${APP_NAME:-cms}"
+APP_NAME="${APP_NAME:-cms-lji}"
 APP_USER="${APP_USER:-ubuntu}"
 DEPLOY_DIR="${DEPLOY_DIR:-/var/www/app/${APP_NAME}}"
-SERVER_DIR="${DEPLOY_DIR}/server"
-CLIENT_DIR="${DEPLOY_DIR}/client"
+CURRENT_DIR="${DEPLOY_DIR}/current"
+RELEASES_DIR="${DEPLOY_DIR}/releases"
+SOURCE_REPO_DIR="${DEPLOY_DIR}/.deploy-source"
+RELEASE_DIR=""
+RELEASE_CREATED=false
+SERVER_DIR="${CURRENT_DIR}/server"
+CLIENT_DIR="${CURRENT_DIR}/client"
 ENV_FILE="${ENV_FILE:-/etc/${APP_NAME}/env}"
 LOG_DIR="/var/log/${APP_NAME}"
+APP_HEALTH_URL="${APP_HEALTH_URL:-}"
+NGINX_CONFIG="/etc/nginx/conf.d/${APP_NAME}.conf"
+NGINX_CONFIG_BACKUP=""
+NGINX_CONFIG_EXISTED=false
+NGINX_CONFIG_CHANGED=false
+NGINX_CONFIG_CANDIDATE=""
+NGINX_DEFAULTS_BACKUP_DIR=""
+NGINX_DEFAULT_SITE_EXISTED=false
+NGINX_DEFAULT_CONF_EXISTED=false
 
 USE_PNPM="${USE_PNPM:-false}"
 USE_UV="${USE_UV:-false}"
@@ -160,10 +174,10 @@ preflight_checks() {
 setup_directories() {
     log_info "Setting up directories..."
 
-    for dir in "${DEPLOY_DIR}" "$(dirname "${ENV_FILE}")" "${LOG_DIR}"; do
+    for dir in "${DEPLOY_DIR}" "${RELEASES_DIR}" "$(dirname "${ENV_FILE}")" "${LOG_DIR}"; do
         if [[ ! -d "${dir}" ]]; then
             sudo mkdir -p "${dir}"
-            sudo chown "${APP_USER}:${APP_USER}" "${dir}"
+            sudo chown "${APP_USER}:$(id -gn "$APP_USER")" "${dir}"
         fi
     done
 
@@ -173,50 +187,108 @@ setup_directories() {
 clone_or_update_repo() {
     log_info "Cloning/updating repository..."
 
-    if [[ -d "$DEPLOY_DIR/.git" ]]; then
-        log_info "Repository exists, fetching..."
-        git -C "$DEPLOY_DIR" fetch --prune --tags --force origin
-    else
-        log_info "Cloning repository..."
-        git clone "$REPO_URL" "$DEPLOY_DIR"
-        git -C "$DEPLOY_DIR" fetch --tags --force origin
+    if [[ ! -d "$SOURCE_REPO_DIR/.git" ]]; then
+        if [[ -e "$SOURCE_REPO_DIR" ]]; then
+            log_error "Source repository path exists but is not a Git checkout: $SOURCE_REPO_DIR"
+            exit 1
+        fi
+        git clone "$REPO_URL" "$SOURCE_REPO_DIR"
     fi
+    git -C "$SOURCE_REPO_DIR" fetch --prune --tags --force origin
 
     # REPO_REF may be a tag (e.g. cp30.1) or a branch — tags have no
     # origin/<ref> tracking ref, so the two cases are handled separately.
-    if git -C "$DEPLOY_DIR" rev-parse -q --verify "refs/tags/${REPO_REF}" >/dev/null; then
+    if git -C "$SOURCE_REPO_DIR" rev-parse -q --verify "refs/tags/${REPO_REF}" >/dev/null; then
         log_info "Checking out tag ${REPO_REF}"
-        git -C "$DEPLOY_DIR" checkout --force "tags/${REPO_REF}"
+        local commit
+        commit="$(git -C "$SOURCE_REPO_DIR" rev-parse "refs/tags/${REPO_REF}^{commit}")"
     else
         log_info "Checking out branch ${REPO_REF}"
-        git -C "$DEPLOY_DIR" checkout --force -B "$REPO_REF" "origin/${REPO_REF}"
+        local commit
+        commit="$(git -C "$SOURCE_REPO_DIR" rev-parse "refs/remotes/origin/${REPO_REF}^{commit}")"
     fi
 
-    git config --global --add safe.directory "$DEPLOY_DIR" 2>/dev/null || true
-    log_info "Repository ready at $(git -C "$DEPLOY_DIR" rev-parse --short HEAD) (${REPO_REF})"
+    local release_id
+    release_id="$(date -u +%Y%m%d%H%M%S)-${commit:0:12}-$$"
+    RELEASE_DIR="${RELEASES_DIR}/${release_id}"
+    git -C "$SOURCE_REPO_DIR" worktree add --detach "$RELEASE_DIR" "$commit"
+    RELEASE_CREATED=true
+
+    log_info "Prepared release ${release_id} (${REPO_REF})"
+}
+
+cleanup_failed_release() {
+    local exit_status=$?
+    trap - EXIT
+
+    if [[ -n "$NGINX_CONFIG_CANDIDATE" ]]; then
+        sudo rm -f "$NGINX_CONFIG_CANDIDATE" || log_warn "Could not remove temporary Nginx config"
+    fi
+
+    if (( exit_status != 0 )); then
+        restore_nginx_config || log_warn "Could not fully restore the previous Nginx configuration"
+        if [[ "$RELEASE_CREATED" == "true" && -d "$RELEASE_DIR" ]] &&
+           [[ "$(readlink -f "$CURRENT_DIR" 2>/dev/null || true)" != "$RELEASE_DIR" ]]; then
+            log_warn "Removing incomplete release: $RELEASE_DIR"
+            if ! git -C "$SOURCE_REPO_DIR" worktree remove --force "$RELEASE_DIR"; then
+                log_warn "Could not remove incomplete release: $RELEASE_DIR"
+            fi
+        fi
+    fi
+
+    exit "$exit_status"
+}
+
+wait_for_app_health() {
+    local check_http="${1:-true}"
+    local deadline_ms=$(( $(date +%s%3N) + 30000 ))
+    local now_ms remaining_ms operation_timeout status
+
+    while :; do
+        now_ms="$(date +%s%3N)"
+        (( now_ms < deadline_ms )) || break
+
+        remaining_ms=$((deadline_ms - now_ms))
+        printf -v operation_timeout '%d.%03d' "$((remaining_ms / 1000))" "$((remaining_ms % 1000))"
+        if timeout "$operation_timeout" systemctl --user is-active --quiet "${APP_NAME}.service"; then
+            if [[ "$check_http" != "true" || -z "$APP_HEALTH_URL" ]]; then
+                return 0
+            fi
+
+            now_ms="$(date +%s%3N)"
+            remaining_ms=$((deadline_ms - now_ms))
+            (( remaining_ms > 0 )) || break
+            (( remaining_ms > 2000 )) && remaining_ms=2000
+            printf -v operation_timeout '%d.%03d' "$((remaining_ms / 1000))" "$((remaining_ms % 1000))"
+            status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+                --max-time "$operation_timeout" "$APP_HEALTH_URL" 2>/dev/null || true)"
+            if [[ "$status" =~ ^2[0-9][0-9]$ ]]; then
+                return 0
+            fi
+        fi
+        sleep 0.25
+    done
+
+    return 1
 }
 
 setup_python() {
     log_info "Setting up Python virtual environment..."
 
-    cd "$SERVER_DIR"
+    cd "${RELEASE_DIR}/server"
 
     local req="$REQUIREMENTS_FILE"
-    [[ -f "$req" ]] || { log_error "Requirements file not found: $SERVER_DIR/$req"; exit 1; }
+    [[ -f "$req" ]] || { log_error "Requirements file not found: ${RELEASE_DIR}/server/$req"; exit 1; }
 
     install_pyenv
 
     if [[ "$USE_UV" == "true" ]]; then
         install_uv
-        if [[ ! -d "env" ]]; then
-            uv venv --seed --python "${PYTHON_VERSION}" env
-        fi
+        uv venv --seed --python "${PYTHON_VERSION}" env
         log_info "Installing Python dependencies..."
         uv pip install --quiet --python env/bin/python -r "$req"
     else
-        if [[ ! -d "env" ]]; then
-            python -m venv env
-        fi
+        python -m venv env
         log_info "Installing Python dependencies..."
         source env/bin/activate
         pip install --quiet --progress-bar off --upgrade pip wheel setuptools
@@ -252,10 +324,11 @@ install_uv() {
 setup_frontend() {
     log_info "Building frontend..."
 
-    cd "$CLIENT_DIR"
+    cd "${RELEASE_DIR}/client"
     install_pnpm
     export NODE_OPTIONS="--max-old-space-size=${NODE_MAX_MEM}"
     export SUPERDESK_URL SUPERDESK_WS_URL
+    rm -rf -- "${RELEASE_DIR}/client/dist"
 
     if [[ "$USE_PNPM" == "true" ]]; then
         pnpm i -ci --quiet
@@ -399,7 +472,7 @@ setup_env_file() {
         "CONTENTAPI_ES_INDEX=$contentapi_es_index" \
         "OPTIONAL_VARS=$optional_vars" | sudo tee "$ENV_FILE" > /dev/null
 
-    sudo chown "$APP_USER:$APP_USER" "$ENV_FILE"
+    sudo chown "$APP_USER:$(id -gn "$APP_USER")" "$ENV_FILE"
     sudo chmod 600 "$ENV_FILE"
     log_success "Environment file created at $ENV_FILE"
 }
@@ -425,7 +498,7 @@ wait_for_services() {
 initialize_database() {
     log_info "Initializing database..."
 
-    cd "$SERVER_DIR"
+    cd "${RELEASE_DIR}/server"
     source env/bin/activate
     set -a
     source "$ENV_FILE"
@@ -461,7 +534,7 @@ create_systemd_service() {
 
     sudo loginctl enable-linger "${USER}"
     systemctl --user daemon-reload
-    systemctl --user enable --now "${APP_NAME}.service"
+    systemctl --user enable "${APP_NAME}.service"
 
     log_success "Systemd service created"
 }
@@ -469,20 +542,133 @@ create_systemd_service() {
 configure_nginx() {
     log_info "Configuring Nginx..."
 
-    install_template "cms.nginx.conf.template" "/etc/nginx/conf.d/${APP_NAME}.conf"
+    NGINX_CONFIG_CANDIDATE="$(sudo mktemp "/etc/nginx/conf.d/.${APP_NAME}.conf.XXXXXX")"
+    if ! render_template "$TEMPLATE_DIR/cms.nginx.conf.template" | sudo tee "$NGINX_CONFIG_CANDIDATE" > /dev/null; then
+        sudo rm -f "$NGINX_CONFIG_CANDIDATE"
+        NGINX_CONFIG_CANDIDATE=""
+        return 1
+    fi
+    sudo chmod 644 "$NGINX_CONFIG_CANDIDATE"
+
+    if [[ -e "$NGINX_CONFIG" ]]; then
+        local backup
+        backup="$(sudo mktemp "/etc/nginx/conf.d/.${APP_NAME}.conf.backup.XXXXXX")"
+        if ! sudo cp -p "$NGINX_CONFIG" "$backup"; then
+            sudo rm -f "$backup"
+            sudo rm -f "$NGINX_CONFIG_CANDIDATE"
+            NGINX_CONFIG_CANDIDATE=""
+            return 1
+        fi
+        NGINX_CONFIG_BACKUP="$backup"
+        NGINX_CONFIG_EXISTED=true
+    fi
+
+    local default_site="/etc/nginx/sites-enabled/default"
+    local default_conf="/etc/nginx/conf.d/default.conf"
+    if [[ -e "$default_site" || -L "$default_site" || -e "$default_conf" || -L "$default_conf" ]]; then
+        NGINX_DEFAULTS_BACKUP_DIR="$(sudo mktemp -d "/etc/nginx/.${APP_NAME}.defaults.XXXXXX")"
+        if [[ -e "$default_site" || -L "$default_site" ]]; then
+            sudo cp -a "$default_site" "${NGINX_DEFAULTS_BACKUP_DIR}/sites-enabled-default"
+            NGINX_DEFAULT_SITE_EXISTED=true
+        fi
+        if [[ -e "$default_conf" || -L "$default_conf" ]]; then
+            sudo cp -a "$default_conf" "${NGINX_DEFAULTS_BACKUP_DIR}/conf.d-default"
+            NGINX_DEFAULT_CONF_EXISTED=true
+        fi
+    fi
+
+    sudo mv "$NGINX_CONFIG_CANDIDATE" "$NGINX_CONFIG"
+    NGINX_CONFIG_CANDIDATE=""
+    NGINX_CONFIG_CHANGED=true
 
     # Remove default config if present
     sudo rm -f /etc/nginx/sites-enabled/default
     sudo rm -f /etc/nginx/conf.d/default.conf
 
-    if sudo nginx -t; then
-        log_success "Nginx configuration valid"
-    else
+    if ! sudo nginx -t; then
+        if ! restore_nginx_config; then
+            log_error "Could not fully restore the previous Nginx configuration"
+        fi
         log_error "Nginx configuration test failed"
-        exit 1
+        return 1
     fi
 
     sudo systemctl enable nginx
+    log_success "Nginx configuration valid"
+}
+
+restore_nginx_config() {
+    local restore_ok=true
+
+    if [[ "$NGINX_CONFIG_CHANGED" == "true" ]]; then
+        if [[ -n "$NGINX_CONFIG_BACKUP" && -e "$NGINX_CONFIG_BACKUP" ]]; then
+            if sudo mv "$NGINX_CONFIG_BACKUP" "$NGINX_CONFIG"; then
+                NGINX_CONFIG_BACKUP=""
+            else
+                log_error "Could not restore Nginx config from $NGINX_CONFIG_BACKUP"
+                restore_ok=false
+            fi
+        elif [[ "$NGINX_CONFIG_EXISTED" == "false" ]]; then
+            if ! sudo rm -f "$NGINX_CONFIG"; then
+                log_error "Could not remove failed Nginx config $NGINX_CONFIG"
+                restore_ok=false
+            fi
+        else
+            log_error "Previous Nginx config backup is missing"
+            restore_ok=false
+        fi
+        if [[ "$restore_ok" == "true" ]]; then
+            NGINX_CONFIG_CHANGED=false
+        fi
+    fi
+
+    if [[ -n "$NGINX_DEFAULTS_BACKUP_DIR" ]]; then
+        if [[ "$NGINX_DEFAULT_SITE_EXISTED" == "true" &&
+              ! -e /etc/nginx/sites-enabled/default && ! -L /etc/nginx/sites-enabled/default ]]; then
+            if ! sudo cp -a "${NGINX_DEFAULTS_BACKUP_DIR}/sites-enabled-default" /etc/nginx/sites-enabled/default; then
+                log_error "Could not restore the default Nginx site"
+                restore_ok=false
+            fi
+        fi
+        if [[ "$NGINX_DEFAULT_CONF_EXISTED" == "true" &&
+              ! -e /etc/nginx/conf.d/default.conf && ! -L /etc/nginx/conf.d/default.conf ]]; then
+            if ! sudo cp -a "${NGINX_DEFAULTS_BACKUP_DIR}/conf.d-default" /etc/nginx/conf.d/default.conf; then
+                log_error "Could not restore the default Nginx config"
+                restore_ok=false
+            fi
+        fi
+        if [[ "$restore_ok" == "true" ]]; then
+            if ! sudo rm -f "${NGINX_DEFAULTS_BACKUP_DIR}/sites-enabled-default" "${NGINX_DEFAULTS_BACKUP_DIR}/conf.d-default" ||
+               ! sudo rmdir "$NGINX_DEFAULTS_BACKUP_DIR"; then
+                log_error "Could not remove temporary Nginx backups"
+                restore_ok=false
+            else
+                NGINX_DEFAULTS_BACKUP_DIR=""
+            fi
+        fi
+    fi
+
+    [[ "$restore_ok" == "true" ]]
+}
+
+commit_nginx_config() {
+    local backup="$NGINX_CONFIG_BACKUP"
+    local defaults_backup_dir="$NGINX_DEFAULTS_BACKUP_DIR"
+    NGINX_CONFIG_CHANGED=false
+    NGINX_CONFIG_BACKUP=""
+    NGINX_DEFAULTS_BACKUP_DIR=""
+    NGINX_DEFAULT_SITE_EXISTED=false
+    NGINX_DEFAULT_CONF_EXISTED=false
+
+    if [[ -n "$backup" ]] && ! sudo rm -f "$backup"; then
+        log_warn "Could not remove temporary Nginx backup: $backup"
+    fi
+    if [[ -n "$defaults_backup_dir" ]]; then
+        if ! sudo rm -f "${defaults_backup_dir}/sites-enabled-default" "${defaults_backup_dir}/conf.d-default" ||
+           ! sudo rmdir "$defaults_backup_dir"; then
+            log_warn "Could not remove temporary Nginx backups: $defaults_backup_dir"
+        fi
+    fi
 }
 
 configure_logrotate() {
@@ -492,7 +678,7 @@ configure_logrotate() {
 }
 
 copy_translations() {
-    local translations_dir="${CLIENT_DIR}/dist/languages"
+    local translations_dir="${RELEASE_DIR}/client/dist/languages"
     local source="/home/${APP_USER}/fr_CA.json"
 
     if [[ -f "$source" ]]; then
@@ -508,19 +694,110 @@ copy_translations() {
 restart_services() {
     log_info "Restarting services..."
 
-    systemctl --user restart "${APP_NAME}.service"
-    sudo systemctl restart nginx
+    local previous_release=""
+    if [[ -L "$CURRENT_DIR" ]]; then
+        previous_release="$(readlink -f "$CURRENT_DIR")"
+    fi
 
-    sleep 3
+    local next_link="${DEPLOY_DIR}/.current-${APP_NAME}-$$"
+    ln -s "$RELEASE_DIR" "$next_link"
+    mv -Tf "$next_link" "$CURRENT_DIR"
 
-    log_info "Services restarted"
+    rollback_release() {
+        log_error "Release activation failed; restoring the previous release"
+        local rollback_ok=true
+        if ! restore_nginx_config; then
+            log_error "Could not fully restore the previous Nginx configuration"
+            rollback_ok=false
+        fi
+        if [[ -n "$previous_release" ]]; then
+            local rollback_link="${DEPLOY_DIR}/.current-rollback-${APP_NAME}-$$"
+            if ! ln -s "$previous_release" "$rollback_link" ||
+               ! mv -Tf "$rollback_link" "$CURRENT_DIR"; then
+                log_error "Could not switch back to the previous application release"
+                rollback_ok=false
+            else
+                if ! systemctl --user restart "${APP_NAME}.service"; then
+                    log_error "Could not restart the previous application release"
+                    rollback_ok=false
+                fi
+            fi
+        else
+            if ! rm -f -- "$CURRENT_DIR"; then
+                log_error "Could not remove failed current release link"
+                rollback_ok=false
+            fi
+            if ! systemctl --user stop "${APP_NAME}.service"; then
+                log_warn "Application service was not running"
+            fi
+        fi
+        if ! sudo systemctl restart nginx; then
+            log_error "Could not restart Nginx after rollback"
+            rollback_ok=false
+        fi
+        if [[ -n "$previous_release" && "$rollback_ok" == "true" ]] && ! wait_for_app_health; then
+            log_error "Previous application release did not become healthy through Nginx"
+            rollback_ok=false
+        fi
+        if [[ "$rollback_ok" != "true" ]]; then
+            log_error "Rollback did not fully restore service health; manual intervention may be required"
+        fi
+    }
+
+    if ! systemctl --user restart "${APP_NAME}.service"; then
+        rollback_release
+        return 1
+    fi
+
+    if ! wait_for_app_health false; then
+        log_error "Application did not become healthy within 30 seconds"
+        rollback_release
+        return 1
+    fi
+
+    if ! sudo systemctl restart nginx; then
+        rollback_release
+        return 1
+    fi
+
+    if ! wait_for_app_health; then
+        log_error "Application did not remain healthy through Nginx after activation"
+        rollback_release
+        return 1
+    fi
+
+    commit_nginx_config
+    log_success "Release activated"
+}
+
+prune_old_releases() {
+    local active_release
+    active_release="$(readlink -f "$CURRENT_DIR")"
+
+    local release_dirs
+    mapfile -t release_dirs < <(find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)
+
+    local retained=1
+    local release
+    for release in "${release_dirs[@]}"; do
+        if [[ "$release" == "$active_release" ]]; then
+            continue
+        fi
+        if (( retained < 3 )); then
+            retained=$((retained + 1))
+            continue
+        fi
+        if ! git -C "$SOURCE_REPO_DIR" worktree remove --force "$release"; then
+            log_warn "Could not remove old release: $release"
+        fi
+    done
 }
 
 show_status() {
     echo ""
     log_success "Deployment complete!"
     echo ""
-    log_info "Ports: API=$WEB_PORT WS=$WS_PORT CAPI=$CAPI_PORT PAPI=$PAPI_PORT | Ref: ${REPO_REF} @ $(git -C "$DEPLOY_DIR" rev-parse --short HEAD)"
+    log_info "Ports: API=$WEB_PORT WS=$WS_PORT CAPI=$CAPI_PORT PAPI=$PAPI_PORT | Ref: ${REPO_REF} @ $(git -C "$RELEASE_DIR" rev-parse --short HEAD)"
     echo ""
     systemctl --user status "${APP_NAME}.service" --no-pager --lines=0 || true
     echo ""
@@ -538,6 +815,24 @@ main() {
 
     time_step "Preflight checks"       preflight_checks
     time_step "Setup directories"      setup_directories
+    local lock_file="/var/lock/superdesk-cms-deploy.lock"
+    local inherited_lock=false
+    if [[ "${DEPLOY_LOCK_HELD:-false}" == "true" &&
+          -e "/proc/${BASHPID}/fd/8" ]] &&
+       [[ "$(stat -Lc '%d:%i' "/proc/${BASHPID}/fd/8")" == "$(stat -Lc '%d:%i' "$lock_file" 2>/dev/null || true)" ]] &&
+       flock -n 8; then
+        inherited_lock=true
+    fi
+    if [[ "$inherited_lock" != "true" ]]; then
+        sudo touch "$lock_file"
+        sudo chown "root:$(id -gn "$APP_USER")" "$lock_file"
+        sudo chmod 660 "$lock_file"
+        exec 9>>"$lock_file"
+        flock -w 300 9 || { log_error "Timed out waiting for another deployment to finish"; exit 1; }
+    fi
+
+    trap cleanup_failed_release EXIT
+
     time_step "Clone/update repo"      clone_or_update_repo
     time_step "Setup Python"           setup_python
     time_step "Build frontend"         setup_frontend
@@ -551,6 +846,7 @@ main() {
     time_step "Configure logrotate"    configure_logrotate
     time_step "Copy translations"      copy_translations
     time_step "Restart services"       restart_services
+    time_step "Prune old releases"     prune_old_releases
     show_status
 
     if [[ "$TIMING" == "true" ]]; then

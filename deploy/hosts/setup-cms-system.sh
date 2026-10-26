@@ -18,6 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Versions
 PYTHON_VERSION="${PYTHON_VERSION:-3.8}"
+APP_USER="${APP_USER:-ubuntu}"
 
 # Timing (set TIMING=true to enable per-step timing)
 TIMING="${TIMING:-false}"
@@ -38,7 +39,6 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
 apt_update() { apt-get update -qq > /dev/null; }
 apt_install() { apt-get install -y -qq "$@" > /dev/null; }
-apt_upgrade() { apt-get upgrade -y -qq > /dev/null; }
 
 # Run a function and print elapsed time if TIMING=true
 time_step() {
@@ -85,7 +85,6 @@ log_info "Starting system setup for Superdesk..."
 install_system_packages() {
     log_info "Updating system packages..."
     apt_update
-    apt_upgrade
 
     log_info "Installing base utilities..."
     apt_install \
@@ -176,8 +175,11 @@ EOF
         apt_update
         apt_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
-        usermod -aG docker ubuntu
         log_success "Docker Engine and Docker Compose plugin installed."
+    fi
+
+    if ! id -nG "$APP_USER" | grep -qw docker; then
+        usermod -aG docker "$APP_USER"
     fi
 
     systemctl enable docker.service

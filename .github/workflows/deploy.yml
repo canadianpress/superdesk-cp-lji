@@ -33,9 +33,17 @@ jobs:
           AWS_REGION="${{ secrets.AWS_REGION }}"
           SSM_ENV_PARAM_NAME="${{ vars.SSM_ENV_PARAM_NAME }}"
           TARGET_USER="${{ vars.TARGET_USER || 'ubuntu' }}"
-          MAX_POLL_TIME="${{ vars.MAX_POLL_TIME || '900' }}"
+          MAX_POLL_TIME="${{ vars.MAX_POLL_TIME || '7500' }}"
           POLL_INTERVAL="${{ vars.POLL_INTERVAL || '10' }}"
+          if [[ ! "$MAX_POLL_TIME" =~ ^[1-9][0-9]*$ || ! "$POLL_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
+            echo "MAX_POLL_TIME and POLL_INTERVAL must be positive integers"
+            exit 1
+          fi
           MAX_ATTEMPTS=$((MAX_POLL_TIME / POLL_INTERVAL))
+          if [ "$MAX_ATTEMPTS" -lt 1 ]; then
+            echo "MAX_POLL_TIME must be at least POLL_INTERVAL"
+            exit 1
+          fi
 
           SSM_COMMANDS=$(cat <<EOF
             set -e
@@ -43,8 +51,14 @@ jobs:
 
             export AWS_DEFAULT_REGION="$AWS_REGION"
 
+            touch /var/lock/cms-lji-deploy.lock
+            chown "root:\$(id -gn '$TARGET_USER')" /var/lock/cms-lji-deploy.lock
+            chmod 660 /var/lock/cms-lji-deploy.lock
+            exec 8>>/var/lock/cms-lji-deploy.lock
+            flock -w 300 8 || { echo "Timed out waiting for another host deployment"; exit 1; }
+
             mkdir -p "$TARGET_DIR"
-            chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_DIR"
+            chown -R "$TARGET_USER:\$(id -gn '$TARGET_USER')" "$TARGET_DIR"
 
             if ! command -v aws &> /dev/null; then
               echo "Installing AWS CLI..."
@@ -57,6 +71,7 @@ jobs:
               REPO_REF="$REPO_REF" \
               AWS_REGION="$AWS_REGION" \
               SSM_ENV_PARAM_NAME="$SSM_ENV_PARAM_NAME" \
+              DEPLOY_LOCK_HELD=true \
               bash -c '
                 set -e
                 exec 2>&1
@@ -101,8 +116,8 @@ jobs:
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${{ secrets.INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
-            --timeout-seconds 1800 \
-            --parameters "{\"commands\": $PAYLOAD}" \
+            --timeout-seconds 3600 \
+            --parameters "{\"commands\": $PAYLOAD, \"executionTimeout\": [\"3600\"]}" \
             --query "Command.CommandId" \
             --output text)
 
@@ -111,7 +126,7 @@ jobs:
           STATUS="InProgress"
           ATTEMPTS=0
 
-          while [ "$STATUS" = "InProgress" ] || [ "$STATUS" = "Pending" ]; do
+          while [ "$STATUS" = "InProgress" ] || [ "$STATUS" = "Pending" ] || [ "$STATUS" = "Delayed" ] || [ "$STATUS" = "Cancelling" ]; do
             if [ $ATTEMPTS -ge $MAX_ATTEMPTS ]; then
               echo "Timed out waiting for SSM command"
               break
