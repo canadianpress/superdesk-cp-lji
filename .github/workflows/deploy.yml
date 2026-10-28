@@ -1,0 +1,28 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to deploy (tag/branch/sha)"
+        required: false
+        default: ""
+
+jobs:
+  deploy:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+    uses: canadianpress/cp-deploy/.github/workflows/deploy-newsroom.yml@main
+    permissions:
+      id-token: write
+    with:
+      TARGET_DIR: ${{ vars.TARGET_DIR }}
+      REPO_URL: ${{ vars.REPO_URL }}
+      REPO_REF: ${{ github.event.inputs.ref != '' && github.event.inputs.ref || vars.REPO_REF }}
+      SSM_ENV_PARAM_NAME: ${{ vars.SSM_ENV_PARAM_NAME }}
+      TARGET_USER: ${{ vars.TARGET_USER || 'ubuntu' }}
+      MAX_POLL_TIME: ${{ vars.MAX_POLL_TIME || '7500' }}
+      POLL_INTERVAL: ${{ vars.POLL_INTERVAL || '10' }}
+    secrets:
+      IAM_ROLE: ${{ secrets.IAM_ROLE }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      INSTANCE_ID: ${{ secrets.INSTANCE_ID }}
